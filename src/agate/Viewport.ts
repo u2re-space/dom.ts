@@ -1,8 +1,10 @@
 /*
  * FIND:virtual-keyboard
- * WHY: Work Center composer reads `--virtual-keyboard-height`. Capacitor Android
- * has no Virtual Keyboard API; IME height comes from visualViewport overlap,
- * layout shrink, or Capacitor Keyboard.
+ * WHY: Work Center composer and markdown raw read `--virtual-keyboard-height`.
+ * Capacitor Android has no Virtual Keyboard API; IME height comes from
+ * visualViewport overlap, layout shrink, or Capacitor Keyboard.
+ * INVARIANT: IME must pin visualViewport / window scroll so shell chrome stays put;
+ * only the inner scrollport moves the caret.
  */
 import type { StyleTuple } from "@fest-lib/style-lib";
 import { addEvent } from "./Utils";
@@ -157,12 +159,108 @@ const readLayoutViewport = (): { width: number; height: number; keyboard: number
     };
 };
 
+const isImeChromeLock = (el: HTMLElement): boolean => {
+    const tag = el.tagName;
+    if (tag === "HTML" || tag === "BODY") return true;
+    const cls = el.classList;
+    return (
+        cls.contains("app-shell") ||
+        cls.contains("app-shell__viewport") ||
+        cls.contains("app-shell__nav") ||
+        cls.contains("env-shell-root") ||
+        cls.contains("env-shell-workspace") ||
+        cls.contains("env-shell-chrome") ||
+        cls.contains("view-viewer__toolbar")
+    );
+};
+
+const parentOf = (el: Element | null): Element | null => {
+    if (!el) return null;
+    if (el.parentElement) return el.parentElement;
+    const root = el.getRootNode();
+    return root instanceof ShadowRoot ? root.host : null;
+};
+
+const isScrollport = (el: HTMLElement): boolean => {
+    if (isImeChromeLock(el)) return false;
+    const style = getComputedStyle(el);
+    const oy = style.overflowY || style.overflowBlock;
+    if (oy !== "auto" && oy !== "scroll") return false;
+    return el.scrollHeight > el.clientHeight + 1;
+};
+
+const findImeScrollport = (start: Element | null): HTMLElement | null => {
+    let node: Element | null = start;
+    while (node) {
+        if (node instanceof HTMLElement && isScrollport(node)) return node;
+        node = parentOf(node);
+    }
+    return null;
+};
+
+const readCaretRect = (): DOMRect | null => {
+    try {
+        const sel = document.getSelection();
+        if (sel?.rangeCount) {
+            const range = sel.getRangeAt(0);
+            const rects = range.getClientRects();
+            const rect = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
+            if (rect && (rect.height || rect.width || rect.top || rect.bottom)) return rect;
+        }
+    } catch {
+        /* no selection */
+    }
+    const el = document.activeElement;
+    return el instanceof HTMLElement ? el.getBoundingClientRect() : null;
+};
+
+const pinImeCaretInScrollport = (): void => {
+    if (!isImeTarget(document.activeElement)) return;
+    const keyboard = readLayoutViewport().keyboard;
+    const vv = window.visualViewport;
+    const visibleBottom = (Number(vv?.height) || Number(window.innerHeight) || 0) - Math.max(8, keyboard ? 12 : 0);
+    if (visibleBottom <= 0) return;
+    const rect = readCaretRect();
+    if (!rect) return;
+    const overflow = rect.bottom - visibleBottom;
+    if (overflow <= 1) return;
+    const port = findImeScrollport(document.activeElement);
+    if (port) port.scrollTop += overflow;
+};
+
+const pinVisualViewport = (): void => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const top = Number(vv.offsetTop) || 0;
+    const left = Number(vv.offsetLeft) || 0;
+    if (!top && !left) return;
+    try {
+        vv.scrollTo({ left: 0, top: 0, behavior: "instant" as ScrollBehavior });
+    } catch {
+        try {
+            (vv as { scrollTo?: (x: number, y: number) => void }).scrollTo?.(0, 0);
+        } catch {
+            /* older WebView */
+        }
+    }
+};
+
 const pinOverlayScroll = (): void => {
     if (typeof window === "undefined") return;
     if (readLayoutViewport().keyboard <= 0 && !isImeTarget(document.activeElement)) return;
-    if (window.scrollY || document.documentElement.scrollTop || document.body?.scrollTop) {
+    pinVisualViewport();
+    if (window.scrollX || window.scrollY || document.documentElement.scrollTop || document.body?.scrollTop) {
         window.scrollTo(0, 0);
     }
+};
+
+const pinImeChrome = (opts?: { caret?: boolean }): void => {
+    pinOverlayScroll();
+    if (!opts?.caret) return;
+    requestAnimationFrame(() => {
+        pinOverlayScroll();
+        pinImeCaretInScrollport();
+    });
 };
 
 //
@@ -278,6 +376,7 @@ const bindCapacitorKeyboard = (): void => {
         const next = Number(info?.keyboardHeight) || 0;
         if (next > 0) capacitorKeyboardHeight = next;
         updateVP();
+        pinImeChrome({ caret: true });
     };
     const onHide = (): void => {
         capacitorKeyboardHeight = 0;
@@ -319,7 +418,13 @@ export const whenAnyScreenChanges = (cb: () => void) => {
         pinOverlayScroll();
         update();
     }, passiveOpts));
-    unsubscribers.push(addEvent(window?.visualViewport, "resize", update, passiveOpts));
+    unsubscribers.push(addEvent(window, "scroll", () => {
+        pinOverlayScroll();
+    }, { capture: true, passive: true }));
+    unsubscribers.push(addEvent(window?.visualViewport, "resize", () => {
+        pinImeChrome({ caret: true });
+        update();
+    }, passiveOpts));
     unsubscribers.push(addEvent(screen?.orientation, "change", update));
     unsubscribers.push(addEvent(window, "resize", update));
     unsubscribers.push(addEvent(document?.documentElement, "fullscreenchange", update));
@@ -333,7 +438,7 @@ export const whenAnyScreenChanges = (cb: () => void) => {
             layoutLockW = Math.max(layoutLockW, Number(window.innerWidth) || 0, Number(window.visualViewport?.width) || 0);
             layoutLockH = Math.max(layoutLockH, Number(window.innerHeight) || 0, Number(window.visualViewport?.height) || 0);
         }
-        pinOverlayScroll();
+        pinImeChrome({ caret: true });
         update();
     }, { capture: true, passive: true }));
     unsubscribers.push(addEvent(document, "focusout", update, passiveOpts));
