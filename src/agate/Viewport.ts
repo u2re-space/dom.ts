@@ -216,8 +216,17 @@ export const ensureVirtualKeyboardOverlay = (): void => {
     }
 };
 
+const deepActiveElement = (): Element | null => {
+    let el: Element | null = typeof document !== "undefined" ? document.activeElement : null;
+    while (el instanceof HTMLElement && el.shadowRoot?.activeElement) {
+        el = el.shadowRoot.activeElement;
+    }
+    return el;
+};
+
 const isImeTarget = (el: Element | null): boolean => {
     if (!el || !(el instanceof HTMLElement)) return false;
+    if (el.localName === "cw-raw-editor") return true;
     if (el.isContentEditable) return true;
     const tag = el.tagName;
     if (tag === "TEXTAREA" || tag === "SELECT") return true;
@@ -382,10 +391,10 @@ const readLayoutViewport = (): { width: number; height: number; keyboard: number
         keyboard = lastStableKeyboard;
     } else if (keyboard >= KEYBOARD_OVERLAY_PX) {
         lastStableKeyboard = keyboard;
-    } else if (!isImeTarget(document.activeElement)) {
+    } else if (!isImeTarget(deepActiveElement()) && !isImeTarget(document.activeElement)) {
         lastStableKeyboard = 0;
     }
-    const imeOpen = keyboard > 0 || isImeTarget(document.activeElement) || suddenShrink || expandedSelection;
+    const imeOpen = keyboard > 0 || isImeTarget(deepActiveElement()) || isImeTarget(document.activeElement) || suddenShrink || expandedSelection;
     if (!imeOpen) {
         layoutLockW = candidateW;
         layoutLockH = candidateH;
@@ -408,6 +417,12 @@ const readLayoutViewport = (): { width: number; height: number; keyboard: number
 const isImeChromeLock = (el: HTMLElement): boolean => {
     const tag = el.tagName;
     if (tag === "HTML" || tag === "BODY") return true;
+    if (
+        tag === "CW-RAW-EDITOR"
+        || tag === "CW-VIEW-VIEWER"
+        || tag === "CW-MARKDOWN-VIEW-FRAME"
+        || tag === "CW-MARKDOWN-TOOLBAR-FRAME"
+    ) return true;
     const cls = el.classList;
     return (
         cls.contains("app-shell") ||
@@ -425,7 +440,8 @@ const isImeChromeLock = (el: HTMLElement): boolean => {
         cls.contains("view-viewer__chrome") ||
         cls.contains("view-viewer__content") ||
         cls.contains("cw-view-viewer-shell") ||
-        cls.contains("cw-markdown-view-frame")
+        cls.contains("cw-markdown-view-frame") ||
+        cls.contains("cw-view-viewer__slot-raw")
     );
 };
 
@@ -444,7 +460,27 @@ const isScrollport = (el: HTMLElement): boolean => {
     return el.scrollHeight > el.clientHeight + 1;
 };
 
+const findRawEditorScrollport = (start: Element | null): HTMLElement | null => {
+    let node: Element | null = start;
+    while (node) {
+        if (node instanceof HTMLElement && node.classList.contains("cw-raw-editor__scroll")) return node;
+        if (node instanceof HTMLElement && node.localName === "cw-raw-editor") {
+            const inner = node.shadowRoot?.querySelector(".cw-raw-editor__scroll");
+            if (inner instanceof HTMLElement) return inner;
+        }
+        const root = node.getRootNode();
+        if (root instanceof ShadowRoot) {
+            const inner = root.querySelector(".cw-raw-editor__scroll");
+            if (inner instanceof HTMLElement) return inner;
+        }
+        node = parentOf(node);
+    }
+    return null;
+};
+
 const findImeScrollport = (start: Element | null): HTMLElement | null => {
+    const raw = findRawEditorScrollport(start);
+    if (raw) return raw;
     let node: Element | null = start;
     while (node) {
         if (node instanceof HTMLElement && isScrollport(node)) return node;
@@ -470,7 +506,8 @@ const readCaretRect = (): DOMRect | null => {
 };
 
 const pinImeCaretInScrollport = (): void => {
-    if (!isImeTarget(document.activeElement)) return;
+    const active = deepActiveElement();
+    if (!isImeTarget(active) && !isImeTarget(document.activeElement)) return;
     /* WHY: Select All's range box is the whole document — scrolling it shifts every surface. */
     if (!isCollapsedCaret()) return;
     const keyboard = readLayoutViewport().keyboard;
@@ -481,7 +518,7 @@ const pinImeCaretInScrollport = (): void => {
     if (!rect) return;
     const overflow = rect.bottom - visibleBottom;
     if (overflow <= 1) return;
-    const port = findImeScrollport(document.activeElement);
+    const port = findImeScrollport(active) || findImeScrollport(document.activeElement);
     if (port) port.scrollTop += overflow;
 };
 
@@ -508,8 +545,8 @@ const resetChromeScroll = (start: Element | null): void => {
     const port = findImeScrollport(start);
     let node: Element | null = start;
     while (node) {
-        if (node instanceof HTMLElement && node !== port && (isImeChromeLock(node) || node.scrollTop || node.scrollLeft)) {
-            if (node !== port) {
+        if (node instanceof HTMLElement && node !== port && isImeChromeLock(node)) {
+            if (node.scrollTop || node.scrollLeft) {
                 node.scrollTop = 0;
                 node.scrollLeft = 0;
             }
@@ -520,19 +557,30 @@ const resetChromeScroll = (start: Element | null): void => {
 
 const pinOverlayScroll = (): void => {
     if (typeof window === "undefined" || overlayPinning) return;
-    const ime = readLayoutViewport().keyboard > 0 || isImeTarget(document.activeElement);
-    if (!ime) return;
+    const active = deepActiveElement();
+    const cap = isNativeCapacitorHost();
+    const raw = Boolean(findRawEditorScrollport(active) || findRawEditorScrollport(document.activeElement));
+    const ime = readLayoutViewport().keyboard > 0 || isImeTarget(active) || isImeTarget(document.activeElement);
+    if (!ime && !cap) return;
     overlayPinning = true;
     try {
         /* INVARIANT: IME/Select All may pan visualViewport; chrome stays at layout origin.
-         * Only the editor scrollport may move. */
+         * Only the editor scrollport may move. Capacitor overscroll must not drag toolbars. */
         pinVisualViewport();
         if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
         const root = document.documentElement;
         const body = document.body;
         if (root.scrollTop || root.scrollLeft) root.scrollTo(0, 0);
         if (body && (body.scrollTop || body.scrollLeft)) body.scrollTo(0, 0);
-        if (!isCollapsedCaret()) resetChromeScroll(document.activeElement);
+        if (raw || ime || !isCollapsedCaret()) {
+            resetChromeScroll(active);
+            resetChromeScroll(document.activeElement);
+        }
+        if (cap) {
+            document.querySelectorAll("cw-raw-editor").forEach((host) => {
+                if (host instanceof HTMLElement && !host.hidden) resetChromeScroll(host);
+            });
+        }
     } finally {
         overlayPinning = false;
     }
@@ -544,7 +592,14 @@ const patchImeScrollIntoView = (): void => {
     scrollIntoViewPatched = true;
     const orig = Element.prototype.scrollIntoView;
     Element.prototype.scrollIntoView = function (this: Element, arg?: boolean | ScrollIntoViewOptions) {
-        if (isImeTarget(document.activeElement) && !isCollapsedCaret()) return;
+        const active = deepActiveElement();
+        const inRaw = Boolean(findRawEditorScrollport(this) || findRawEditorScrollport(active));
+        if (inRaw || (isImeTarget(active) && !isCollapsedCaret())) {
+            if (isNativeCapacitorHost() || !isCollapsedCaret()) {
+                pinImeChrome({ caret: true });
+                return;
+            }
+        }
         if (this instanceof HTMLElement && isImeChromeLock(this)) return;
         return orig.call(this, arg as never);
     };
@@ -764,6 +819,9 @@ export const whenAnyScreenChanges = (cb: () => void) => {
     unsubscribers.push(addEvent(window, "scroll", () => {
         pinOverlayScroll();
     }, { capture: true, passive: true }));
+    unsubscribers.push(addEvent(document, "scroll", () => {
+        pinOverlayScroll();
+    }, { capture: true, passive: true }));
     unsubscribers.push(addEvent(window?.visualViewport, "resize", () => {
         pinImeChrome({ caret: true });
         update();
@@ -793,7 +851,7 @@ export const whenAnyScreenChanges = (cb: () => void) => {
         bindCapacitorKeyboard();
         bindNativeDisplay();
         ensureVirtualKeyboardOverlay();
-        if (isImeTarget(document.activeElement)) {
+        if (isImeTarget(deepActiveElement()) || isImeTarget(document.activeElement)) {
             layoutLockW = Math.max(layoutLockW, Number(window.innerWidth) || 0, Number(window.visualViewport?.width) || 0);
             layoutLockH = Math.max(layoutLockH, Number(window.innerHeight) || 0, Number(window.visualViewport?.height) || 0);
         }
