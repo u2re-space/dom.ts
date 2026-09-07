@@ -615,6 +615,10 @@ const pinImeChrome = (opts?: { caret?: boolean }): void => {
 };
 
 //
+/** IME overlay height in CSS px. Capacitor: Keyboard plugin only (no `env(keyboard-inset-*)`). */
+export const readVirtualKeyboardHeightPx = (): number =>
+    typeof window === "undefined" ? 0 : readLayoutViewport().keyboard;
+
 export const getAvailSize = () => {
     ensureVirtualKeyboardOverlay();
     const vv = typeof window !== "undefined" ? window.visualViewport : null;
