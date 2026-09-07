@@ -111,9 +111,19 @@ const isImeTarget = (el: Element | null): boolean => {
     return !["button", "checkbox", "radio", "file", "submit", "reset", "image", "range", "color", "hidden"].includes(type);
 };
 
+const isCollapsedCaret = (): boolean => {
+    try {
+        const sel = document.getSelection();
+        return Boolean(sel && sel.rangeCount && sel.isCollapsed);
+    } catch {
+        return true;
+    }
+};
+
 let layoutLockOrient = "";
 let layoutLockW = 0;
 let layoutLockH = 0;
+let lastStableKeyboard = 0;
 
 export type FixedOverlayViewport = {
     left: number;
@@ -195,7 +205,17 @@ const readLayoutViewport = (): { width: number; height: number; keyboard: number
         const shrink = Math.max(0, layoutLockH - candidateH, layoutLockH - (vvH + vvTop));
         if (shrink >= KEYBOARD_OVERLAY_PX) keyboard = shrink;
     }
-    const imeOpen = keyboard > 0 || isImeTarget(document.activeElement) || suddenShrink;
+    /* WHY: Select All / handles shrink visualViewport again. That is not more IME —
+     * keep the last real keyboard height so shell tokens and editor padding stay put. */
+    const expandedSelection = !isCollapsedCaret();
+    if (expandedSelection && lastStableKeyboard >= KEYBOARD_OVERLAY_PX) {
+        keyboard = lastStableKeyboard;
+    } else if (keyboard >= KEYBOARD_OVERLAY_PX) {
+        lastStableKeyboard = keyboard;
+    } else if (!isImeTarget(document.activeElement)) {
+        lastStableKeyboard = 0;
+    }
+    const imeOpen = keyboard > 0 || isImeTarget(document.activeElement) || suddenShrink || expandedSelection;
     if (!imeOpen) {
         layoutLockW = candidateW;
         layoutLockH = candidateH;
@@ -221,7 +241,16 @@ const isImeChromeLock = (el: HTMLElement): boolean => {
         cls.contains("env-shell-root") ||
         cls.contains("env-shell-workspace") ||
         cls.contains("env-shell-chrome") ||
-        cls.contains("view-viewer__toolbar")
+        cls.contains("env-ui-window") ||
+        cls.contains("env-ui-window__body") ||
+        cls.contains("wf-frame") ||
+        cls.contains("ui-window") ||
+        cls.contains("view-viewer") ||
+        cls.contains("view-viewer__toolbar") ||
+        cls.contains("view-viewer__chrome") ||
+        cls.contains("view-viewer__content") ||
+        cls.contains("cw-view-viewer-shell") ||
+        cls.contains("cw-markdown-view-frame")
     );
 };
 
@@ -265,15 +294,6 @@ const readCaretRect = (): DOMRect | null => {
     return el instanceof HTMLElement ? el.getBoundingClientRect() : null;
 };
 
-const isCollapsedCaret = (): boolean => {
-    try {
-        const sel = document.getSelection();
-        return Boolean(sel && sel.rangeCount && sel.isCollapsed);
-    } catch {
-        return true;
-    }
-};
-
 const pinImeCaretInScrollport = (): void => {
     if (!isImeTarget(document.activeElement)) return;
     /* WHY: Select All's range box is the whole document — scrolling it shifts every surface. */
@@ -307,15 +327,52 @@ const pinVisualViewport = (): void => {
     }
 };
 
-const pinOverlayScroll = (): void => {
-    if (typeof window === "undefined") return;
-    /* WHY: Capacitor adjustNothing — pinning window/visualViewport on Select All jumps the shell. */
-    if (isNativeCapacitorHost()) return;
-    if (readLayoutViewport().keyboard <= 0 && !isImeTarget(document.activeElement)) return;
-    pinVisualViewport();
-    if (window.scrollX || window.scrollY || document.documentElement.scrollTop || document.body?.scrollTop) {
-        window.scrollTo(0, 0);
+let overlayPinning = false;
+
+const resetChromeScroll = (start: Element | null): void => {
+    const port = findImeScrollport(start);
+    let node: Element | null = start;
+    while (node) {
+        if (node instanceof HTMLElement && node !== port && (isImeChromeLock(node) || node.scrollTop || node.scrollLeft)) {
+            if (node !== port) {
+                node.scrollTop = 0;
+                node.scrollLeft = 0;
+            }
+        }
+        node = parentOf(node);
     }
+};
+
+const pinOverlayScroll = (): void => {
+    if (typeof window === "undefined" || overlayPinning) return;
+    const ime = readLayoutViewport().keyboard > 0 || isImeTarget(document.activeElement);
+    if (!ime) return;
+    overlayPinning = true;
+    try {
+        /* INVARIANT: IME/Select All may pan visualViewport; chrome stays at layout origin.
+         * Only the editor scrollport may move. */
+        pinVisualViewport();
+        if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+        const root = document.documentElement;
+        const body = document.body;
+        if (root.scrollTop || root.scrollLeft) root.scrollTo(0, 0);
+        if (body && (body.scrollTop || body.scrollLeft)) body.scrollTo(0, 0);
+        if (!isCollapsedCaret()) resetChromeScroll(document.activeElement);
+    } finally {
+        overlayPinning = false;
+    }
+};
+
+let scrollIntoViewPatched = false;
+const patchImeScrollIntoView = (): void => {
+    if (scrollIntoViewPatched || typeof Element === "undefined") return;
+    scrollIntoViewPatched = true;
+    const orig = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element, arg?: boolean | ScrollIntoViewOptions) {
+        if (isImeTarget(document.activeElement) && !isCollapsedCaret()) return;
+        if (this instanceof HTMLElement && isImeChromeLock(this)) return;
+        return orig.call(this, arg as never);
+    };
 };
 
 const pinImeChrome = (opts?: { caret?: boolean }): void => {
@@ -347,12 +404,9 @@ export const getAvailSize = () => {
         "--virtual-keyboard-height": `${layout.keyboard}px`
     };
     if (typeof document !== "undefined") {
-        /* WHY: `html[data-vk-open]` resizes viewer/shell. Capacitor must not flip it
-         * on Select All / false IME; padding still reads `--virtual-keyboard-height`. */
-        document.documentElement.toggleAttribute(
-            "data-vk-open",
-            layout.keyboard > 0 && !isNativeCapacitorHost()
-        );
+        /* WHY: `html[data-vk-open]` + `max-block-size: 100%` shrinks the whole shell
+         * to the visual viewport (Select All / handles). IME is padding-only. */
+        document.documentElement.removeAttribute("data-vk-open");
     }
     if (typeof screen != "undefined") {
         const aw = screen?.availWidth + "px";
@@ -504,8 +558,12 @@ export const whenAnyScreenChanges = (cb: () => void) => {
     const unsubscribers: Array<() => void> = [];
 
     bindCapacitorKeyboard();
+    patchImeScrollIntoView();
     // @ts-ignore
     unsubscribers.push(addEvent(navigator?.virtualKeyboard, "geometrychange", update, passiveOpts));
+    unsubscribers.push(addEvent(document, "selectionchange", () => {
+        pinOverlayScroll();
+    }, passiveOpts));
     unsubscribers.push(addEvent(window?.visualViewport, "scroll", () => {
         pinOverlayScroll();
         update();
