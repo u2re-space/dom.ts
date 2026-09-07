@@ -3,8 +3,8 @@
  * WHY: Work Center composer and markdown raw read `--virtual-keyboard-height`.
  * Capacitor Android has no Virtual Keyboard API; IME height comes from
  * visualViewport overlap, layout shrink, or Capacitor Keyboard.
- * INVARIANT: IME must pin visualViewport / window scroll so shell chrome stays put;
- * only the inner scrollport moves the caret.
+ * INVARIANT: IME must not shift shell / `--lv-height`. Capacitor uses Keyboard
+ * plugin height only — visualViewport shrink (Select All, handles) is not IME.
  */
 import type { StyleTuple } from "@fest-lib/style-lib";
 import { addEvent } from "./Utils";
@@ -31,7 +31,20 @@ type CapacitorKeyboardLike = {
 
 let capacitorKeyboardHeight = 0;
 let capacitorKeyboardBound = false;
+let windowKeyboardBound = false;
 let viewportTrackingStarted = false;
+
+const isNativeCapacitorHost = (): boolean => {
+    try {
+        if (typeof document !== "undefined" && document.documentElement.dataset.cwspNativeShell === "capacitor") {
+            return true;
+        }
+        const cap = (globalThis as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
+        return typeof cap?.isNativePlatform === "function" && Boolean(cap.isNativePlatform());
+    } catch {
+        return false;
+    }
+};
 
 const virtualKeyboard = (): VirtualKeyboardLike | null => {
     try {
@@ -41,8 +54,34 @@ const virtualKeyboard = (): VirtualKeyboardLike | null => {
     }
 };
 
-/* WHY: PWA + Android WebView otherwise resize the layout viewport under the IME. */
+const INTERACTIVE_WIDGET = "interactive-widget=overlays-content";
+
+/** Stamp `interactive-widget=overlays-content` on the viewport meta ([MDN viewport](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/meta/name/viewport)). */
+export const ensureViewportInteractiveWidgetOverlay = (): void => {
+    if (typeof document === "undefined") return;
+    const head = document.head || document.documentElement;
+    if (!head) return;
+    let meta = document.querySelector('meta[name="viewport"]') as HTMLMetaElement | null;
+    if (!meta) {
+        meta = document.createElement("meta");
+        meta.setAttribute("name", "viewport");
+        meta.content = `width=device-width, initial-scale=1.0, viewport-fit=cover, ${INTERACTIVE_WIDGET}`;
+        head.insertBefore(meta, head.firstChild);
+        return;
+    }
+    const raw = String(meta.content || "").trim();
+    if (/interactive-widget\s*=\s*overlays-content/i.test(raw)) return;
+    if (/interactive-widget\s*=/i.test(raw)) {
+        meta.content = raw.replace(/interactive-widget\s*=\s*[a-z-]+/i, INTERACTIVE_WIDGET);
+        return;
+    }
+    meta.content = raw ? `${raw.replace(/,\s*$/, "")}, ${INTERACTIVE_WIDGET}` : INTERACTIVE_WIDGET;
+};
+
+/* WHY: VirtualKeyboard API overlaysContent + viewport interactive-widget=overlays-content
+ * so IME does not resize layout / visual viewport ([MDN VirtualKeyboard](https://developer.mozilla.org/en-US/docs/Web/API/VirtualKeyboard_API)). */
 export const ensureVirtualKeyboardOverlay = (): void => {
+    ensureViewportInteractiveWidgetOverlay();
     const vk = virtualKeyboard();
     if (!vk) return;
     try {
@@ -121,14 +160,16 @@ const readLayoutViewport = (): { width: number; height: number; keyboard: number
     const vkH = Number(virtualKeyboard()?.boundingBox?.height) || 0;
     const vvOverlap = innerH > 0 && vvH > 0 ? innerH - vvH - vvTop : 0;
     const capH = capacitorKeyboardHeight;
-    let keyboard =
-        capH >= KEYBOARD_OVERLAY_PX
-            ? capH
-            : vkH >= KEYBOARD_OVERLAY_PX
-              ? vkH
-              : vvOverlap >= KEYBOARD_OVERLAY_PX
-                ? vvOverlap
-                : 0;
+    /* WHY: Capacitor Select All / selection handles shrink visualViewport; that is
+     * not the IME. Overlay height comes only from the Keyboard plugin (or VK API). */
+    const nativeCap = isNativeCapacitorHost();
+    let keyboard = capH >= KEYBOARD_OVERLAY_PX
+        ? capH
+        : !nativeCap && vkH >= KEYBOARD_OVERLAY_PX
+          ? vkH
+          : !nativeCap && vvOverlap >= KEYBOARD_OVERLAY_PX
+            ? vvOverlap
+            : 0;
     const candidateW = Math.max(innerW, vvW);
     const candidateH = Math.max(innerH, vvH + vvTop, keyboard > 0 ? vvH + keyboard : 0);
     const orient = typeof matchMedia !== "undefined" && matchMedia("(orientation: landscape)")?.matches ? "l" : "p";
@@ -139,7 +180,7 @@ const readLayoutViewport = (): { width: number; height: number; keyboard: number
     }
     /* WHY: Android often resizes the WebView before `focusin`; a sudden height drop
      * is the IME even when `innerHeight` and `visualViewport` shrink together. */
-    const suddenShrink = layoutLockH > 0 && layoutLockH - candidateH >= KEYBOARD_OVERLAY_PX;
+    const suddenShrink = !nativeCap && layoutLockH > 0 && layoutLockH - candidateH >= KEYBOARD_OVERLAY_PX;
     if (keyboard < KEYBOARD_OVERLAY_PX && suddenShrink) {
         const shrink = Math.max(0, layoutLockH - candidateH, layoutLockH - (vvH + vvTop));
         if (shrink >= KEYBOARD_OVERLAY_PX) keyboard = shrink;
@@ -214,8 +255,19 @@ const readCaretRect = (): DOMRect | null => {
     return el instanceof HTMLElement ? el.getBoundingClientRect() : null;
 };
 
+const isCollapsedCaret = (): boolean => {
+    try {
+        const sel = document.getSelection();
+        return Boolean(sel && sel.rangeCount && sel.isCollapsed);
+    } catch {
+        return true;
+    }
+};
+
 const pinImeCaretInScrollport = (): void => {
     if (!isImeTarget(document.activeElement)) return;
+    /* WHY: Select All's range box is the whole document — scrolling it shifts every surface. */
+    if (!isCollapsedCaret()) return;
     const keyboard = readLayoutViewport().keyboard;
     const vv = window.visualViewport;
     const visibleBottom = (Number(vv?.height) || Number(window.innerHeight) || 0) - Math.max(8, keyboard ? 12 : 0);
@@ -247,6 +299,8 @@ const pinVisualViewport = (): void => {
 
 const pinOverlayScroll = (): void => {
     if (typeof window === "undefined") return;
+    /* WHY: Capacitor adjustNothing — pinning window/visualViewport on Select All jumps the shell. */
+    if (isNativeCapacitorHost()) return;
     if (readLayoutViewport().keyboard <= 0 && !isImeTarget(document.activeElement)) return;
     pinVisualViewport();
     if (window.scrollX || window.scrollY || document.documentElement.scrollTop || document.body?.scrollTop) {
@@ -283,7 +337,12 @@ export const getAvailSize = () => {
         "--virtual-keyboard-height": `${layout.keyboard}px`
     };
     if (typeof document !== "undefined") {
-        document.documentElement.toggleAttribute("data-vk-open", layout.keyboard > 0);
+        /* WHY: `html[data-vk-open]` resizes viewer/shell. Capacitor must not flip it
+         * on Select All / false IME; padding still reads `--virtual-keyboard-height`. */
+        document.documentElement.toggleAttribute(
+            "data-vk-open",
+            layout.keyboard > 0 && !isNativeCapacitorHost()
+        );
     }
     if (typeof screen != "undefined") {
         const aw = screen?.availWidth + "px";
@@ -348,7 +407,40 @@ export const getCorrectOrientation = () => {
 const passiveOpts = { passive: true };
 
 //
+const applyCapacitorKeyboardHeight = (raw: unknown): void => {
+    const next = Number(raw) || 0;
+    if (next > 0) capacitorKeyboardHeight = next;
+    updateVP();
+    pinImeChrome({ caret: true });
+};
+
+const clearCapacitorKeyboardHeight = (): void => {
+    capacitorKeyboardHeight = 0;
+    updateVP();
+};
+
+/* WHY: native Keyboard also dispatches window CustomEvents; plugin stub may appear after first focus. */
+const bindWindowKeyboardEvents = (): void => {
+    if (windowKeyboardBound || typeof window === "undefined") return;
+    windowKeyboardBound = true;
+    const onShow = (ev: Event): void => {
+        const e = ev as Event & { keyboardHeight?: number; detail?: { keyboardHeight?: number } | string };
+        const detail = e.detail;
+        const fromDetail = typeof detail === "string"
+            ? (() => {
+                try { return JSON.parse(detail)?.keyboardHeight; } catch { return 0; }
+            })()
+            : detail?.keyboardHeight;
+        applyCapacitorKeyboardHeight(e.keyboardHeight ?? fromDetail);
+    };
+    window.addEventListener("keyboardWillShow", onShow);
+    window.addEventListener("keyboardDidShow", onShow);
+    window.addEventListener("keyboardWillHide", clearCapacitorKeyboardHeight);
+    window.addEventListener("keyboardDidHide", clearCapacitorKeyboardHeight);
+};
+
 const bindCapacitorKeyboard = (): void => {
+    bindWindowKeyboardEvents();
     if (capacitorKeyboardBound || typeof globalThis === "undefined") return;
     const cap = (
         globalThis as {
@@ -372,20 +464,10 @@ const bindCapacitorKeyboard = (): void => {
     } catch {
         /* optional */
     }
-    const onShow = (info?: { keyboardHeight?: number }): void => {
-        const next = Number(info?.keyboardHeight) || 0;
-        if (next > 0) capacitorKeyboardHeight = next;
-        updateVP();
-        pinImeChrome({ caret: true });
-    };
-    const onHide = (): void => {
-        capacitorKeyboardHeight = 0;
-        updateVP();
-    };
-    Keyboard.addListener("keyboardWillShow", onShow);
-    Keyboard.addListener("keyboardDidShow", onShow);
-    Keyboard.addListener("keyboardWillHide", onHide);
-    Keyboard.addListener("keyboardDidHide", onHide);
+    Keyboard.addListener("keyboardWillShow", (info) => applyCapacitorKeyboardHeight(info?.keyboardHeight));
+    Keyboard.addListener("keyboardDidShow", (info) => applyCapacitorKeyboardHeight(info?.keyboardHeight));
+    Keyboard.addListener("keyboardWillHide", clearCapacitorKeyboardHeight);
+    Keyboard.addListener("keyboardDidHide", clearCapacitorKeyboardHeight);
 };
 
 /** Start IME / visualViewport listeners once (Process Capacitor has no SpeedDial). */
@@ -460,5 +542,12 @@ export const fixOrientToScreen = (element: HTMLElement & { orient?: number }) =>
             element.setAttribute?.("orient", String(next));
             element.style?.setProperty?.("--orient", String(next));
         });
+    }
+}
+
+if (typeof document !== "undefined") {
+    ensureVirtualKeyboardOverlay();
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => ensureVirtualKeyboardOverlay(), { once: true });
     }
 }
