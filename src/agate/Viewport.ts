@@ -55,8 +55,9 @@ const virtualKeyboard = (): VirtualKeyboardLike | null => {
 };
 
 const INTERACTIVE_WIDGET = "interactive-widget=overlays-content";
+const VIEWPORT_FIT = "viewport-fit=cover";
 
-/** Stamp `interactive-widget=overlays-content` on the viewport meta ([MDN viewport](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/meta/name/viewport)). */
+/** Stamp overlay IME + `viewport-fit=cover` ([MDN viewport](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/meta/name/viewport)). */
 export const ensureViewportInteractiveWidgetOverlay = (): void => {
     if (typeof document === "undefined") return;
     const head = document.head || document.documentElement;
@@ -65,17 +66,26 @@ export const ensureViewportInteractiveWidgetOverlay = (): void => {
     if (!meta) {
         meta = document.createElement("meta");
         meta.setAttribute("name", "viewport");
-        meta.content = `width=device-width, initial-scale=1.0, viewport-fit=cover, ${INTERACTIVE_WIDGET}`;
+        meta.content = `width=device-width, initial-scale=1.0, ${VIEWPORT_FIT}, ${INTERACTIVE_WIDGET}`;
         head.insertBefore(meta, head.firstChild);
         return;
     }
-    const raw = String(meta.content || "").trim();
-    if (/interactive-widget\s*=\s*overlays-content/i.test(raw)) return;
-    if (/interactive-widget\s*=/i.test(raw)) {
-        meta.content = raw.replace(/interactive-widget\s*=\s*[a-z-]+/i, INTERACTIVE_WIDGET);
-        return;
+    let content = String(meta.content || "").trim();
+    if (!/interactive-widget\s*=\s*overlays-content/i.test(content)) {
+        if (/interactive-widget\s*=/i.test(content)) {
+            content = content.replace(/interactive-widget\s*=\s*[a-z-]+/i, INTERACTIVE_WIDGET);
+        } else {
+            content = content ? `${content.replace(/,\s*$/, "")}, ${INTERACTIVE_WIDGET}` : INTERACTIVE_WIDGET;
+        }
     }
-    meta.content = raw ? `${raw.replace(/,\s*$/, "")}, ${INTERACTIVE_WIDGET}` : INTERACTIVE_WIDGET;
+    if (!/viewport-fit\s*=\s*cover/i.test(content)) {
+        if (/viewport-fit\s*=/i.test(content)) {
+            content = content.replace(/viewport-fit\s*=\s*[a-z-]+/i, VIEWPORT_FIT);
+        } else {
+            content = content ? `${content.replace(/,\s*$/, "")}, ${VIEWPORT_FIT}` : VIEWPORT_FIT;
+        }
+    }
+    if (content !== String(meta.content || "").trim()) meta.content = content;
 };
 
 /* WHY: VirtualKeyboard API overlaysContent + viewport interactive-widget=overlays-content

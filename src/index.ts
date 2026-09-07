@@ -2,6 +2,8 @@ export * from "./agate/Properties";
 export * from "./agate/Detect";
 export * from "./agate/Zoom";
 export * from "./agate/Utils";
+/* WHY: side-effect — `export *` can drop Viewport and skip overlaysContent / interactive-widget. */
+import "./agate/Viewport";
 export * from "./agate/Viewport";
 export * from "./agate/Measure";
 export * from "./agate/LauncherGrid";
