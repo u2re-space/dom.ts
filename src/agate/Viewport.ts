@@ -125,6 +125,53 @@ let layoutLockW = 0;
 let layoutLockH = 0;
 let lastStableKeyboard = 0;
 
+const isLandscape = (): boolean => {
+    try {
+        const type = typeof screen !== "undefined" ? String(screen.orientation?.type || "") : "";
+        if (type.startsWith("landscape")) return true;
+        if (type.startsWith("portrait")) return false;
+        return Boolean(typeof matchMedia !== "undefined" && matchMedia("(orientation: landscape)")?.matches);
+    } catch {
+        return false;
+    }
+};
+
+/** CSS-px box of the physical screen on the current orientation. 0 = unknown (do not clamp). */
+const readPhysicalScreen = (): { width: number; height: number } => {
+    if (typeof screen === "undefined") return { width: 0, height: 0 };
+    const sw = Number(screen.width) || 0;
+    const sh = Number(screen.height) || 0;
+    const aw = Number(screen.availWidth) || 0;
+    const ah = Number(screen.availHeight) || 0;
+    /* WHY: `availHeight` on Android drops the nav/gesture inset; the WebView is taller.
+     * `min(screen, avail)` painted a black strip. The outer box is the max. */
+    const w = Math.max(sw, aw);
+    const h = Math.max(sh, ah);
+    if (!w && !h) return { width: 0, height: 0 };
+    const landscape = isLandscape();
+    const boxLandscape = w > 0 && h > 0 && w > h;
+    const boxPortrait = w > 0 && h > 0 && w < h;
+    if (landscape && boxPortrait) return { width: h, height: w };
+    if (!landscape && boxLandscape) return { width: h, height: w };
+    return { width: w || h, height: h || w };
+};
+
+const clampToPhysical = (width: number, height: number): { width: number; height: number } => {
+    const phys = readPhysicalScreen();
+    const innerW = typeof window !== "undefined" ? Number(window.innerWidth) || 0 : 0;
+    const innerH = typeof window !== "undefined" ? Number(window.innerHeight) || 0 : 0;
+    const root = typeof document !== "undefined" ? document.documentElement : null;
+    const clientW = Number(root?.clientWidth) || 0;
+    const clientH = Number(root?.clientHeight) || 0;
+    /* INVARIANT: never shrink below the live WebView — only cap runaway growth. */
+    const capW = Math.max(phys.width, innerW, clientW);
+    const capH = Math.max(phys.height, innerH, clientH);
+    return {
+        width: capW > 0 ? Math.min(width, capW) : width,
+        height: capH > 0 ? Math.min(height, capH) : height,
+    };
+};
+
 export type FixedOverlayViewport = {
     left: number;
     top: number;
@@ -192,7 +239,7 @@ const readLayoutViewport = (): { width: number; height: number; keyboard: number
             : 0;
     const candidateW = Math.max(innerW, vvW);
     const candidateH = Math.max(innerH, vvH + vvTop, keyboard > 0 ? vvH + keyboard : 0);
-    const orient = typeof matchMedia !== "undefined" && matchMedia("(orientation: landscape)")?.matches ? "l" : "p";
+    const orient = isLandscape() ? "l" : "p";
     if (orient !== layoutLockOrient) {
         layoutLockOrient = orient;
         layoutLockW = 0;
@@ -223,10 +270,15 @@ const readLayoutViewport = (): { width: number; height: number; keyboard: number
         layoutLockW = Math.max(candidateW, layoutLockW);
         layoutLockH = Math.max(candidateH, layoutLockH);
     }
+    /* INVARIANT: screen viewport never exceeds the physical screen (orientation-aware). */
+    const locked = clampToPhysical(layoutLockW || candidateW, layoutLockH || candidateH);
+    layoutLockW = locked.width;
+    layoutLockH = locked.height;
+    const kb = locked.height > 0 ? Math.min(keyboard, locked.height) : keyboard;
     return {
-        width: layoutLockW || candidateW,
-        height: layoutLockH || candidateH,
-        keyboard
+        width: locked.width,
+        height: locked.height,
+        keyboard: kb
     };
 };
 
@@ -387,7 +439,6 @@ const pinImeChrome = (opts?: { caret?: boolean }): void => {
 //
 export const getAvailSize = () => {
     ensureVirtualKeyboardOverlay();
-    const l = typeof matchMedia != "undefined" ? matchMedia("(orientation: landscape)")?.matches : false;
     const vv = typeof window !== "undefined" ? window.visualViewport : null;
     const layout = readLayoutViewport();
     const vvBlock: Record<string, string> = {
@@ -409,23 +460,28 @@ export const getAvailSize = () => {
         document.documentElement.removeAttribute("data-vk-open");
     }
     if (typeof screen != "undefined") {
-        const aw = screen?.availWidth + "px";
-        const ah = screen?.availHeight + "px";
+        const phys = readPhysicalScreen();
+        const innerW = typeof window !== "undefined" ? Number(window.innerWidth) || 0 : 0;
+        const innerH = typeof window !== "undefined" ? Number(window.innerHeight) || 0 : 0;
+        const capW = Math.max(phys.width, innerW, layout.width);
+        const capH = Math.max(phys.height, innerH, layout.height);
+        const screenW = capW > 0 ? `${capW}px` : "100lvi";
+        const screenH = capH > 0 ? `${capH}px` : "100lvb";
         return {
-            "--screen-width": Math.min(screen?.width, screen?.availWidth) + "px",
-            "--screen-height": Math.min(screen?.height, screen?.availHeight) + "px",
-            "--avail-width": l ? ah : aw,
-            "--avail-height": l ? aw : ah,
-            "--view-height": `${layout.height || Math.min(screen?.availHeight, window?.innerHeight) || 0}px`,
+            "--screen-width": screenW,
+            "--screen-height": screenH,
+            "--avail-width": screenW,
+            "--avail-height": screenH,
+            "--view-height": `${layout.height}px`,
             "--pixel-ratio": String(devicePixelRatio || 1),
             ...vvBlock
         };
     };
     return {
-        "--screen-width": 0 + "px",
-        "--screen-height": 0 + "px",
-        "--avail-width": 0 + "px",
-        "--avail-height": 0 + "px",
+        "--screen-width": "100lvi",
+        "--screen-height": "100lvb",
+        "--avail-width": "100lvi",
+        "--avail-height": "100lvb",
         "--view-height": `${layout.height}px`,
         "--pixel-ratio": "1",
         ...vvBlock
