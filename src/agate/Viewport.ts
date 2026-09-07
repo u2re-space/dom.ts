@@ -1,10 +1,12 @@
 /*
  * FIND:virtual-keyboard
+ * TAG:native-display,screen-viewport
  * WHY: Work Center composer and markdown raw read `--virtual-keyboard-height`.
  * Capacitor Android has no Virtual Keyboard API; IME height comes from
  * visualViewport overlap, layout shrink, or Capacitor Keyboard.
  * INVARIANT: IME must not shift shell / `--lv-height`. Capacitor uses Keyboard
  * plugin height only — visualViewport shrink (Select All, handles) is not IME.
+ * Capacitor screen CSS-px / density / DPI come from CwsBridge (FIND:native-display).
  */
 import type { StyleTuple } from "@fest-lib/style-lib";
 import { addEvent } from "./Utils";
@@ -29,10 +31,32 @@ type CapacitorKeyboardLike = {
     setResizeMode?: (opts: { mode: string }) => Promise<void> | void;
 };
 
+type CwsBridgeDisplayLike = {
+    getDisplayMetrics?: () => Promise<Record<string, unknown>>;
+    getShellInfo?: () => Promise<Record<string, unknown>>;
+};
+
+type NativeDisplayMetrics = {
+    windowWidthCss: number;
+    windowHeightCss: number;
+    displayWidthCss: number;
+    displayHeightCss: number;
+    density: number;
+    densityDpi: number;
+    xdpi: number;
+    ydpi: number;
+    ppi: number;
+    scaledDensity: number;
+    fontScale: number;
+};
+
 let capacitorKeyboardHeight = 0;
 let capacitorKeyboardBound = false;
 let windowKeyboardBound = false;
 let viewportTrackingStarted = false;
+let nativeDisplay: NativeDisplayMetrics | null = null;
+let nativeDisplayBound = false;
+let nativeDisplayRefreshQueued = false;
 
 const isNativeCapacitorHost = (): boolean => {
     try {
@@ -44,6 +68,97 @@ const isNativeCapacitorHost = (): boolean => {
     } catch {
         return false;
     }
+};
+
+const readCwsBridge = (): CwsBridgeDisplayLike | null => {
+    try {
+        const cap = (
+            globalThis as { Capacitor?: { Plugins?: { CwsBridge?: CwsBridgeDisplayLike } } }
+        ).Capacitor;
+        return cap?.Plugins?.CwsBridge ?? null;
+    } catch {
+        return null;
+    }
+};
+
+const parseNativeDisplay = (info: Record<string, unknown> | null | undefined): NativeDisplayMetrics | null => {
+    if (!info) return null;
+    const windowW = Number(info.windowWidthCss) || 0;
+    const windowH = Number(info.windowHeightCss) || 0;
+    const displayW = Number(info.displayWidthCss) || windowW;
+    const displayH = Number(info.displayHeightCss) || windowH;
+    const w = windowW || displayW;
+    const h = windowH || displayH;
+    if (w <= 0 || h <= 0) return null;
+    const density = Number(info.density) || 0;
+    return {
+        windowWidthCss: w,
+        windowHeightCss: h,
+        displayWidthCss: displayW || w,
+        displayHeightCss: displayH || h,
+        density,
+        densityDpi: Number(info.densityDpi) || 0,
+        xdpi: Number(info.xdpi) || 0,
+        ydpi: Number(info.ydpi) || 0,
+        ppi: Number(info.ppi) || 0,
+        scaledDensity: Number(info.scaledDensity) || density,
+        fontScale: Number(info.fontScale) || (density > 0 ? (Number(info.scaledDensity) || density) / density : 1),
+    };
+};
+
+const applyNativeDisplay = (info: Record<string, unknown> | null | undefined): void => {
+    const next = parseNativeDisplay(info);
+    if (!next) return;
+    const prev = nativeDisplay;
+    const same = Boolean(
+        prev
+        && prev.windowWidthCss === next.windowWidthCss
+        && prev.windowHeightCss === next.windowHeightCss
+        && prev.displayWidthCss === next.displayWidthCss
+        && prev.displayHeightCss === next.displayHeightCss
+        && prev.density === next.density
+        && prev.densityDpi === next.densityDpi
+        && prev.ppi === next.ppi
+        && prev.fontScale === next.fontScale
+    );
+    nativeDisplay = next;
+    if (!same) updateVP();
+};
+
+const refreshNativeDisplay = (): void => {
+    if (!isNativeCapacitorHost()) return;
+    const Bridge = readCwsBridge();
+    if (!Bridge) return;
+    const req = typeof Bridge.getDisplayMetrics === "function"
+        ? Bridge.getDisplayMetrics()
+        : Bridge.getShellInfo?.();
+    void req?.then((info) => applyNativeDisplay(info)).catch(() => { /* plugin optional */ });
+};
+
+const queueNativeDisplayRefresh = (): void => {
+    if (!isNativeCapacitorHost() || nativeDisplayRefreshQueued) return;
+    nativeDisplayRefreshQueued = true;
+    runWhenIdle(() => {
+        nativeDisplayRefreshQueued = false;
+        bindNativeDisplay();
+        refreshNativeDisplay();
+    }, 80);
+};
+
+const bindNativeDisplay = (): void => {
+    if (nativeDisplayBound || typeof globalThis === "undefined") return;
+    if (!isNativeCapacitorHost()) return;
+    if (!readCwsBridge()) return;
+    nativeDisplayBound = true;
+    try {
+        const cached = (
+            globalThis as { window?: { __CWS_SHELL_INFO__?: Record<string, unknown> } }
+        ).window?.__CWS_SHELL_INFO__;
+        if (cached) applyNativeDisplay(cached);
+    } catch {
+        /* optional */
+    }
+    refreshNativeDisplay();
 };
 
 const virtualKeyboard = (): VirtualKeyboardLike | null => {
@@ -138,15 +253,23 @@ const isLandscape = (): boolean => {
 
 /** CSS-px box of the physical screen on the current orientation. 0 = unknown (do not clamp). */
 const readPhysicalScreen = (): { width: number; height: number } => {
-    if (typeof screen === "undefined") return { width: 0, height: 0 };
-    const sw = Number(screen.width) || 0;
-    const sh = Number(screen.height) || 0;
-    const aw = Number(screen.availWidth) || 0;
-    const ah = Number(screen.availHeight) || 0;
-    /* WHY: `availHeight` on Android drops the nav/gesture inset; the WebView is taller.
-     * `min(screen, avail)` painted a black strip. The outer box is the max. */
-    const w = Math.max(sw, aw);
-    const h = Math.max(sh, ah);
+    /* WHY: Capacitor `screen.width` / `availHeight` skip nav/cutout or swap axes.
+     * Native WindowMetrics is the activity/WebView box; DisplayMetrics is the panel. */
+    let w = 0;
+    let h = 0;
+    if (nativeDisplay) {
+        w = nativeDisplay.windowWidthCss || nativeDisplay.displayWidthCss;
+        h = nativeDisplay.windowHeightCss || nativeDisplay.displayHeightCss;
+    } else if (typeof screen !== "undefined") {
+        const sw = Number(screen.width) || 0;
+        const sh = Number(screen.height) || 0;
+        const aw = Number(screen.availWidth) || 0;
+        const ah = Number(screen.availHeight) || 0;
+        /* WHY: `availHeight` on Android drops the nav/gesture inset; the WebView is taller.
+         * `min(screen, avail)` painted a black strip. The outer box is the max. */
+        w = Math.max(w, sw, aw);
+        h = Math.max(h, sh, ah);
+    }
     if (!w && !h) return { width: 0, height: 0 };
     const landscape = isLandscape();
     const boxLandscape = w > 0 && h > 0 && w > h;
@@ -467,13 +590,25 @@ export const getAvailSize = () => {
         const capH = Math.max(phys.height, innerH, layout.height);
         const screenW = capW > 0 ? `${capW}px` : "100lvi";
         const screenH = capH > 0 ? `${capH}px` : "100lvb";
+        const density = nativeDisplay?.density || Number(devicePixelRatio) || 1;
+        const nativeScale: Record<string, string> = nativeDisplay
+            ? {
+                "--native-density": String(nativeDisplay.density || density),
+                "--native-dpi": String(nativeDisplay.densityDpi || 0),
+                "--native-ppi": String(nativeDisplay.ppi || 0),
+                "--native-xdpi": String(nativeDisplay.xdpi || 0),
+                "--native-ydpi": String(nativeDisplay.ydpi || 0),
+                "--native-font-scale": String(nativeDisplay.fontScale || 1),
+            }
+            : {};
         return {
             "--screen-width": screenW,
             "--screen-height": screenH,
             "--avail-width": screenW,
             "--avail-height": screenH,
             "--view-height": `${layout.height}px`,
-            "--pixel-ratio": String(devicePixelRatio || 1),
+            "--pixel-ratio": String(density),
+            ...nativeScale,
             ...vvBlock
         };
     };
@@ -595,6 +730,7 @@ export const ensureViewportTracking = (): void => {
     if (viewportTrackingStarted || typeof window === "undefined") return;
     viewportTrackingStarted = true;
     bindCapacitorKeyboard();
+    bindNativeDisplay();
     whenAnyScreenChanges(() => {});
 };
 
@@ -614,6 +750,7 @@ export const whenAnyScreenChanges = (cb: () => void) => {
     const unsubscribers: Array<() => void> = [];
 
     bindCapacitorKeyboard();
+    bindNativeDisplay();
     patchImeScrollIntoView();
     // @ts-ignore
     unsubscribers.push(addEvent(navigator?.virtualKeyboard, "geometrychange", update, passiveOpts));
@@ -631,14 +768,30 @@ export const whenAnyScreenChanges = (cb: () => void) => {
         pinImeChrome({ caret: true });
         update();
     }, passiveOpts));
-    unsubscribers.push(addEvent(screen?.orientation, "change", update));
-    unsubscribers.push(addEvent(window, "resize", update));
-    unsubscribers.push(addEvent(document?.documentElement, "fullscreenchange", update));
+    unsubscribers.push(addEvent(screen?.orientation, "change", () => {
+        queueNativeDisplayRefresh();
+        update();
+    }));
+    unsubscribers.push(addEvent(window, "resize", () => {
+        queueNativeDisplayRefresh();
+        update();
+    }));
+    unsubscribers.push(addEvent(document?.documentElement, "fullscreenchange", () => {
+        queueNativeDisplayRefresh();
+        update();
+    }));
     unsubscribers.push(addEvent(document, "DOMContentLoaded", update));
-    unsubscribers.push(addEvent(matchMedia("(orientation: portrait)"), "change", update));
-    unsubscribers.push(addEvent(matchMedia("(orientation: landscape)"), "change", update));
+    unsubscribers.push(addEvent(matchMedia("(orientation: portrait)"), "change", () => {
+        queueNativeDisplayRefresh();
+        update();
+    }));
+    unsubscribers.push(addEvent(matchMedia("(orientation: landscape)"), "change", () => {
+        queueNativeDisplayRefresh();
+        update();
+    }));
     unsubscribers.push(addEvent(document, "focusin", () => {
         bindCapacitorKeyboard();
+        bindNativeDisplay();
         ensureVirtualKeyboardOverlay();
         if (isImeTarget(document.activeElement)) {
             layoutLockW = Math.max(layoutLockW, Number(window.innerWidth) || 0, Number(window.visualViewport?.width) || 0);
